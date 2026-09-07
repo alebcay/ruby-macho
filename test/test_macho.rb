@@ -637,6 +637,42 @@ class MachOFileTest < Minitest::Test
     end
   end
 
+  def test_change_rpath_failure_preserves_original
+    [
+      [fixture(:x86_64, "hello.bin"), "made_up_path", {}, 2_612],
+      [fixture(:x86_64, "libdupe.dylib"), "foo", { :uniq => true }, 15_812],
+      [fixture(:x86_64, "libdupe.dylib"), "foo", { :last => true }, 15_812],
+    ].each do |filename, old_path, options, path_length|
+      file = MachO::MachOFile.new(filename)
+      original_rpaths = file.rpaths
+      original_data = file.serialize.dup
+
+      # This is the shortest path that makes its command extend past the first
+      # segment file offset for this fixture.
+      assert_raises MachO::OffsetInsertionError do
+        file.change_rpath(old_path, "a" * path_length, options)
+      end
+
+      assert_equal original_rpaths, file.rpaths
+      assert_equal original_data, file.serialize
+    end
+  end
+
+  def test_change_rpath_duplicate_header_pad_failure_preserves_original
+    file = MachO::MachOFile.new(fixture(:x86_64, "libdupe.dylib"))
+    original_rpaths = file.rpaths
+    original_data = file.serialize.dup
+
+    # This path makes the load-command region 16,392 bytes, eight bytes past
+    # this fixture's first segment at offset 16,384.
+    assert_raises MachO::HeaderPadError do
+      file.change_rpath("foo", "a" * 15_748)
+    end
+
+    assert_equal original_rpaths, file.rpaths
+    assert_equal original_data, file.serialize
+  end
+
   def test_delete_rpath
     groups = SINGLE_ARCHES.map do |arch|
       ["hello.bin", "hello_actual.bin"].map do |fn|

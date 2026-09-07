@@ -377,6 +377,8 @@ module MachO
 
       new_lc = LoadCommands::LoadCommand.create(:LC_RPATH, new_path)
 
+      validate_rpath_replacement(old_lc, new_lc, old_path, options)
+
       delete_rpath(old_path, options)
       insert_command(old_lc.view.offset, new_lc)
     end
@@ -481,6 +483,24 @@ module MachO
       @dylib_load_commands = nil
       @load_commands_by_type = nil
       @segment_alignment = nil
+    end
+
+    # Check all changes before deleting any matching rpath commands.
+    def validate_rpath_replacement(old_lc, new_lc, old_path, options)
+      uniq = options.fetch(:uniq, false)
+      last = options.fetch(:last, false)
+      raise ArgumentError, "Cannot set both :uniq and :last to true" if uniq && last
+
+      rpath_cmds = command(:LC_RPATH).select { |r| r.path.to_s == old_path }
+      rpath_cmds = [rpath_cmds.last] if last
+      rpath_cmds = [rpath_cmds.first] unless uniq || last
+      removed_size = rpath_cmds.sum(&:cmdsize)
+      cmd_raw = new_lc.serialize(LoadCommands::LoadCommand::SerializationContext.context_for(self))
+      new_sizeofcmds = sizeofcmds - removed_size + cmd_raw.bytesize
+      fileoff = old_lc.view.offset + cmd_raw.bytesize
+
+      raise OffsetInsertionError, old_lc.view.offset if old_lc.view.offset < header.class.bytesize || fileoff > low_fileoff
+      raise HeaderPadError, @filename if header.class.bytesize + new_sizeofcmds > low_fileoff
     end
 
     # The file's Mach-O header structure.
