@@ -273,7 +273,121 @@ class MachOCodeSigningTest < Minitest::Test
     end
   end
 
+  def test_reads_an_embedded_info_plist
+    macho = MachO::MachOFile.new_from_bin(info_plist_bin)
+
+    assert_equal info_plist_section(macho).size, MachO::CodeSigning.info_plist(macho).bytesize
+  end
+
+  def test_rejects_an_info_plist_whose_range_exceeds_the_file
+    bin = info_plist_bin
+    bin[section_size_offset, 8] = [bin.bytesize * 4].pack("Q<")
+    macho = MachO::MachOFile.new_from_bin(bin)
+
+    assert_operator info_plist_section(macho).offset + info_plist_section(macho).size,
+                    :>, macho.serialize.bytesize
+    # The reader stays total; only the signer treats the file as unusable.
+    assert_nil MachO::CodeSigning.info_plist(macho)
+
+    error = assert_raises MachO::CodeSigningError do
+      macho.codesign!
+    end
+    assert_match(/__info_plist extends past the end of the Mach-O/, error.message)
+  end
+
+  def test_omits_an_empty_info_plist
+    bin = info_plist_bin
+    bin[section_size_offset, 8] = [0].pack("Q<")
+    macho = MachO::MachOFile.new_from_bin(bin)
+
+    assert_equal 0, info_plist_section(macho).size
+    assert_nil MachO::CodeSigning.info_plist(macho)
+  end
+
+  def test_rejects_an_info_plist_whose_range_exceeds_the_file_before_modifying_it
+    bin = info_plist_bin
+    bin[section_size_offset, 8] = [bin.bytesize * 4].pack("Q<")
+
+    tempfile_with_data("hello", bin) do |file|
+      original = File.binread(file.path)
+
+      error = assert_raises MachO::CodeSigningError do
+        MachO.codesign!(file.path)
+      end
+      assert_match(/__info_plist extends past the end of the Mach-O/, error.message)
+      assert_equal original, File.binread(file.path)
+    end
+  end
+
+  def test_signs_a_macho_with_an_empty_info_plist
+    bin = info_plist_bin
+    bin[section_size_offset, 8] = [0].pack("Q<")
+
+    tempfile_with_data("hello", bin) do |file|
+      MachO.codesign!(file.path)
+
+      signed = MachO.open(file.path)
+      assert_valid_ad_hoc_signature(signed)
+      code_directories(signed).each do |code_directory|
+        assert_equal "\x00".b * code_directory.hash_size,
+                     code_directory.special_hash(MachO::CodeSigning::CSSLOT_INFOSLOT)
+      end
+    end
+  end
+
+  def test_signs_a_macho_with_a_readable_info_plist
+    bin = info_plist_bin
+    plist = MachO::CodeSigning.info_plist(MachO::MachOFile.new_from_bin(bin))
+    refute_nil plist
+
+    tempfile_with_data("hello", bin) do |file|
+      MachO.codesign!(file.path)
+
+      signed = MachO.open(file.path)
+      assert_valid_ad_hoc_signature(signed)
+      code_directories(signed).each do |code_directory|
+        digest = if code_directory.hash_type == MachO::CodeSigning::CS_HASHTYPE_SHA1
+          Digest::SHA1
+        else
+          Digest::SHA256
+        end
+        assert_equal digest.digest(plist),
+                     code_directory.special_hash(MachO::CodeSigning::CSSLOT_INFOSLOT)
+      end
+    end
+  end
+
   private
+
+  # Byte offset of hello.bin's first __TEXT section header. Renaming its sectname
+  # yields a __TEXT,__info_plist section so the Info.plist paths can be exercised.
+  def info_plist_header_offset
+    @info_plist_header_offset ||= begin
+      macho = MachO::MachOFile.new(fixture(:x86_64, "hello.bin"))
+      segment = macho.segments.find { |candidate| candidate.segname == "__TEXT" }
+      segment.view.offset + segment.class.bytesize
+    end
+  end
+
+  # Section64: sectname(0..15) segname(16..31) addr(32..39) size(40..47) offset(48..51)
+  def section_size_offset
+    info_plist_header_offset + 40
+  end
+
+  def info_plist_bin
+    bin = File.binread(fixture(:x86_64, "hello.bin"))
+    bin[info_plist_header_offset, 16] = "__info_plist".ljust(16, "\x00")
+    bin
+  end
+
+  def info_plist_section(macho)
+    segment = macho.segments.find { |candidate| candidate.segname == "__TEXT" }
+    segment.sections.find { |section| section.sectname == "__info_plist" }
+  end
+
+  def code_directories(macho)
+    macho[:LC_CODE_SIGNATURE].first.superblob.blobs.grep(MachO::CodeSigning::CodeDirectory)
+  end
 
   def entitlement_blob
     payload = "<?xml version=\"1.0\"?><plist><dict/></plist>"

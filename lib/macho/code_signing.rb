@@ -396,6 +396,8 @@ module MachO
       # Embeds a new signature.
       # @return [void]
       def sign!
+        validate_info_plist_section
+
         signature_commands = @macho[:LC_CODE_SIGNATURE]
         raise CodeSigningError, "Mach-O contains multiple LC_CODE_SIGNATURE commands" if signature_commands.size > 1
 
@@ -428,6 +430,18 @@ module MachO
       end
 
       private
+
+      # Rejects a Mach-O whose Info.plist section header describes bytes the file
+      # does not contain. Signing it would mean either hashing unrelated bytes as
+      # if they were a plist or dropping the Info.plist slot without a word, and
+      # either way the result would not describe the file that was signed.
+      def validate_info_plist_section
+        section = CodeSigning.info_plist_section(@macho)
+        return unless section&.size&.positive?
+        return if section.offset + section.size <= @macho.serialize.bytesize
+
+        raise CodeSigningError, "__info_plist extends past the end of the Mach-O"
+      end
 
       def metadata_from(signature_command)
         return default_metadata unless signature_command&.datasize&.positive?
@@ -570,14 +584,25 @@ module MachO
       "#{filename}-#{identity}"
     end
 
-    # Returns an embedded Info.plist, if present.
+    # Returns the __TEXT,__info_plist section header, if present.
     # @param macho [MachOFile] a Mach-O slice
-    # @return [String, nil]
-    def self.info_plist(macho)
-      section = macho.segments.flat_map(&:sections).find do |candidate|
+    # @return [Section, Section64, nil] the section header
+    def self.info_plist_section(macho)
+      macho.segments.flat_map(&:sections).find do |candidate|
         candidate.segname == "__TEXT" && candidate.sectname == "__info_plist"
       end
-      macho.serialize.byteslice(section.offset, section.size) if section
+    end
+
+    # Returns an embedded Info.plist, if present.
+    # @param macho [MachOFile] a Mach-O slice
+    # @return [String, nil] the Info.plist contents, or nil if the section is
+    #  absent, empty, or its declared range is not fully present in the file
+    def self.info_plist(macho)
+      section = info_plist_section(macho)
+      return unless section&.size&.positive?
+      return unless section.offset + section.size <= macho.serialize.bytesize
+
+      macho.serialize.byteslice(section.offset, section.size)
     end
   end
 end
